@@ -502,7 +502,7 @@ class FileResponse(StreamingHttpResponse):
 
 
 class ServerSentEventsMessage:
-    def __init__(self, data: bytes, event: bytes = None, event_id: int = None, retry: int = None):
+    def __init__(self, data: bytes, *, event: bytes = None, event_id: int = None, retry: int = None):
         self.data = data
         self.event = event
         self.id = event_id
@@ -543,7 +543,8 @@ class ServerSentEventsResponse(HttpResponseBase):
           default is used if not set.
         """
         super().__init__(*args, **kwargs)
-        self._receive: Callable[[], Awaitable[str]] = receive
+        self._receive = receive
+        self.receive_disconnect: Callable[[], Awaitable[bool]] = None
 
         self.event_name: str = event_name
         if isinstance(self.event_name, str):
@@ -571,6 +572,27 @@ class ServerSentEventsResponse(HttpResponseBase):
             "Use `receive` instead." % self.__class__.__name__
         )
 
+    def __aiter__(self):
+        if not self.receive_disconnect:
+            raise Exception('Disconnect handler was not set.')
+        return self
+
+    async def __anext__(self) -> bytes:
+        server_sent_event_future = asyncio.ensure_future(self.receive())
+        is_disconnected_future = asyncio.ensure_future(self.receive_disconnect())
+        done, pending = await asyncio.wait({
+            server_sent_event_future,
+            is_disconnected_future,
+        }, return_when=asyncio.FIRST_COMPLETED)
+
+        for future in pending:
+            future.cancel()
+        for future in done:
+            result = future.result()
+            if future is is_disconnected_future and result:
+                raise StopAsyncIteration()
+            return result
+
     async def receive(self) -> bytes:
         """
         Return Server Sent Event bytes from messages received from coroutine
@@ -592,6 +614,14 @@ class ServerSentEventsResponse(HttpResponseBase):
             message.retry = self.reconnect_timeout_ms
 
         return bytes(message)
+
+    def set_disconnect_handler(self, listen_disconnect: Callable[[], Awaitable[bool]]) -> None:
+        """
+        Set disconnect handler.
+
+        Required to stop streaming on asgi's `http.disconnect` message.
+        """
+        self.receive_disconnect = listen_disconnect
 
     def add_resource_closer(self, closer: Callable[[], Any]) -> None:
         """

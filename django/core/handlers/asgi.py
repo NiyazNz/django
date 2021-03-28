@@ -1,4 +1,4 @@
-import asyncio
+import functools
 import logging
 import sys
 import tempfile
@@ -12,7 +12,7 @@ from django.core.exceptions import RequestAborted, RequestDataTooBig
 from django.core.handlers import base
 from django.http import (
     FileResponse, HttpRequest, HttpResponse, HttpResponseBadRequest,
-    HttpResponseServerError, QueryDict, ServerSentEventsResponse, parse_cookie,
+    HttpResponseServerError, QueryDict, parse_cookie,
 )
 from django.http.response import ServerSentEventsMessage
 from django.urls import set_script_prefix
@@ -237,46 +237,23 @@ class ASGIHandler(base.BaseHandler):
             'status': response.status_code,
             'headers': response_headers,
         })
+        # Streaming responses need to be pinned to their iterator.
         if response.streaming:
-            if isinstance(response, ServerSentEventsResponse):
-                if response.reconnect_timeout_ms:
-                    await send({
-                        "type": "http.response.body",
-                        "body": ServerSentEventsMessage(retry=response.reconnect_timeout_ms),
-                        "more_body": True,
-                    })
-
-                stop_stream = False
-                while not stop_stream:
-                    server_sent_event_future = asyncio.ensure_future(response.receive())
-                    # also listening asgi http.disconnect message to stop
-                    request_response_cycle_future = asyncio.ensure_future(receive())
-                    done, pending = await asyncio.wait({
-                        server_sent_event_future,
-                        request_response_cycle_future,
-                    }, return_when=asyncio.FIRST_COMPLETED)
-                    for future in pending:
-                        future.cancel()
-                    for future in done:
-                        try:
-                            message = future.result()
-                        except StopAsyncIteration:
-                            stop_stream = True
-                            break
-                        if message:
-                            if future is request_response_cycle_future and message.get('type') == 'http.disconnect':
-                                stop_stream = True
-                                break
-                            else:
-                                await send({
-                                    'type': 'http.response.body',
-                                    'body': message,
-                                    'more_body': True,
-                                })
+            # Access `__iter__/__aiter__` and not `streaming_content` directly in case
+            # it has been overridden in a subclass.
+            if hasattr(response, '__aiter__'):
+                if hasattr(response, 'set_disconnect_handler'):
+                    response.set_disconnect_handler(functools.partial(self.listen_for_disconnect, receive))
+                async for part in response:
+                    for chunk, _ in self.chunk_bytes(part):
+                        await send({
+                            'type': 'http.response.body',
+                            'body': chunk,
+                            # Ignore "more" as there may be more parts; instead,
+                            # use an empty final closing message with False.
+                            'more_body': True,
+                        })
             else:
-                # Streaming responses need to be pinned to their iterator.
-                # Access `__iter__` and not `streaming_content` directly in case
-                # it has been overridden in a subclass.
                 for part in response:
                     for chunk, _ in self.chunk_bytes(part):
                         await send({
@@ -298,6 +275,11 @@ class ASGIHandler(base.BaseHandler):
                     'more_body': not last,
                 })
         await sync_to_async(response.close, thread_sensitive=True)()
+
+    async def listen_for_disconnect(self, receive) -> bool:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            return True
 
     @classmethod
     def chunk_bytes(cls, data):

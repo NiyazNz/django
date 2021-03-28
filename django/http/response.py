@@ -6,10 +6,11 @@ import os
 import re
 import sys
 import time
-from collections.abc import Mapping
+import typing
+from collections.abc import AsyncIterator, Mapping
 from email.header import Header
 from http.client import responses
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Union
 from urllib.parse import quote, urlparse
 
 from asgiref.sync import async_to_sync
@@ -500,27 +501,62 @@ class FileResponse(StreamingHttpResponse):
             self.headers['Content-Disposition'] = 'attachment'
 
 
+class ServerSentEventsMessage:
+    def __init__(self, data: bytes, event: bytes = None, event_id: int = None, retry: int = None):
+        self.data = data
+        self.event = event
+        self.id = event_id
+        self.retry = retry
+
+    def __bytes__(self):
+        message = b''
+        if self.event is not None:
+            message += b'event: %s\n' % self.event
+        if self.id is not None:
+            message += b'id: %d\n' % self.id
+        if self.retry is not None:
+            message += b'retry: %d\n' % self.retry
+        message += b'data: %s\n\n' % self.data or b''
+        return message
+
+
 class ServerSentEventsResponse(HttpResponseBase):
     streaming = True
 
-    def __init__(self, receive: Callable[[], Awaitable[str]], *args,
-                 event_name: str = None, last_event_id: int = None, retry: int = None, **kwargs):
+    def __init__(self, receive: Union[Callable[[], Awaitable[Union[ServerSentEventsMessage, Any]]],
+                                      typing.AsyncIterator[Union[ServerSentEventsMessage, Any]]],
+                 *args, event_name: Union[str, bytes] = None, last_event_id: int = None,
+                 reconnect=True, reconnect_timeout_ms: int = None, **kwargs):
         """
-        An event streaming (Server sent events - SSE) HTTP response class with a coroutine as a message generator.
+        Server-Sent Events (SSE) response class
 
-        :param receive: coroutine or awaitable generating messages.
+        An async streaming HTTP response class that accepts messages from
+        a coroutine or AsyncIterator.
+
+        :param receive: coroutine function or AsyncIterator that waits for and
+          returns a message
         :param event_name: event stream's event name.
-        :param last_event_id: event stream's last event id. Can be taken from the `Last-Event-ID` request header.
-        :param retry: event stream's reconnection time.
+        :param last_event_id: event stream's last event id. Can be taken from
+          the `Last-Event-ID` request header.
+        :param reconnect: try to reconnect on connection losses.
+        :param reconnect_timeout_ms: event stream's reconnection timeout. Client
+          default is used if not set.
         """
         super().__init__(*args, **kwargs)
         self._receive: Callable[[], Awaitable[str]] = receive
 
         self.event_name: str = event_name
-        self.retry: int = retry
+        if isinstance(self.event_name, str):
+            self.event_name = self.event_name.encode(self.charset)
+
         self.last_event_id: Optional[int] = None
         if last_event_id is not None:
             self.last_event_id = int(last_event_id)
+
+        if not reconnect:
+            self.status_code = 204
+        self.reconnect_timeout_ms: int = reconnect_timeout_ms
+        self.reconnect_timeout_is_sent = False  # send once
 
         # set SSE headers
         self['Content-Type'] = 'text/event-stream'
@@ -535,30 +571,29 @@ class ServerSentEventsResponse(HttpResponseBase):
             "Use `receive` instead." % self.__class__.__name__
         )
 
-    @property
-    def retry_message(self) -> bytes:
-        return b'retry: %s\n\n' % self.retry
-
-    def get_data_message(self, data) -> bytes:
-        message = b''
-        if self.event_name:
-            message += b'event: %s\n' % self.event_name
-        if self.last_event_id is not None:
-            message += b'id: %d\n' % self.last_event_id
-        message += b'data: %s\n\n' % data
-        return message
-
     async def receive(self) -> bytes:
         """
-        Receive event from coroutine
+        Return Server Sent Event bytes from messages received from coroutine
         """
-        message = await self._receive()
+        if isinstance(self._receive, AsyncIterator):
+            message = await self._receive.__anext__()
+        else:
+            message = await self._receive()
+        if not isinstance(message, ServerSentEventsMessage):
+            data = self.make_bytes(message)
+            message = ServerSentEventsMessage(data, event=self.event_name)
+
         if self.last_event_id is not None:
             self.last_event_id += 1
-        message = self.make_bytes(message)
-        return self.get_data_message(message)
+            message.id = self.last_event_id
 
-    def add_resource_closer(self, closer: Callable[[], Any]):
+        if not message.retry and not self.reconnect_timeout_is_sent and self.reconnect_timeout_ms:
+            self.reconnect_timeout_is_sent = True
+            message.retry = self.reconnect_timeout_ms
+
+        return bytes(message)
+
+    def add_resource_closer(self, closer: Callable[[], Any]) -> None:
         """
         Add resource close method to be called on completion of the request.
         """

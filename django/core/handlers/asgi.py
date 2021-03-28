@@ -14,6 +14,7 @@ from django.http import (
     FileResponse, HttpRequest, HttpResponse, HttpResponseBadRequest,
     HttpResponseServerError, QueryDict, ServerSentEventsResponse, parse_cookie,
 )
+from django.http.response import ServerSentEventsMessage
 from django.urls import set_script_prefix
 from django.utils.functional import cached_property
 
@@ -238,10 +239,10 @@ class ASGIHandler(base.BaseHandler):
         })
         if response.streaming:
             if isinstance(response, ServerSentEventsResponse):
-                if response.retry:
+                if response.reconnect_timeout_ms:
                     await send({
                         "type": "http.response.body",
-                        "body": response.retry_message,
+                        "body": ServerSentEventsMessage(retry=response.reconnect_timeout_ms),
                         "more_body": True,
                     })
 
@@ -257,7 +258,11 @@ class ASGIHandler(base.BaseHandler):
                     for future in pending:
                         future.cancel()
                     for future in done:
-                        message = future.result()
+                        try:
+                            message = future.result()
+                        except StopAsyncIteration:
+                            stop_stream = True
+                            break
                         if message:
                             if future is request_response_cycle_future and message.get('type') == 'http.disconnect':
                                 stop_stream = True
